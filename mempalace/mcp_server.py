@@ -2157,6 +2157,25 @@ def tool_add_drawer(
     path because no row is stored under the logical group id.
     """
     global _metadata_cache
+
+    # Phase 1 privacy filters (must run before sanitize_content so redaction is
+    # honored even if downstream sanitization rewrites whitespace). Verbatim-always
+    # still holds for everything that *does* get stored — these filters only drop
+    # regions the user has explicitly marked as <private> or <mempalace-skip>.
+    if "<mempalace-skip>" in content:
+        return {
+            "success": True,
+            "skipped": True,
+            "reason": "mempalace_skip_tag",
+        }
+    content = re.sub(r"<private>.*?</private>", "", content, flags=re.DOTALL)
+    if not content.strip():
+        return {
+            "success": True,
+            "skipped": True,
+            "reason": "empty_after_private_strip",
+        }
+
     try:
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
