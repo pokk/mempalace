@@ -2141,6 +2141,53 @@ def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int)
     return chunk_ids, chunk_docs, chunk_metas
 
 
+def _strip_private_blocks(content: str) -> str:
+    """Strip ``<private>...</private>`` blocks, failing closed on malformed input.
+
+    Behavior:
+    - Properly paired tags are removed, including nested pairs (the outermost
+      envelope and everything inside it).
+    - An unmatched opening ``<private>`` strips everything from that tag through
+      end-of-content. The privacy contract requires erring on the side of
+      deleting more than the user intended, never less.
+    - An unmatched closing ``</private>`` strips everything from start-of-content
+      through that closing tag.
+
+    A naive ``re.sub`` with ``<private>.*?</private>`` fails open on these
+    malformed cases — for a privacy feature that is unacceptable.
+    """
+    opens = [(m.start(), m.end(), "open") for m in re.finditer(r"<private>", content)]
+    closes = [(m.start(), m.end(), "close") for m in re.finditer(r"</private>", content)]
+    tokens = sorted(opens + closes, key=lambda t: t[0])
+    if not tokens:
+        return content
+
+    kept: list[tuple[int, int]] = []
+    pos = 0
+    depth = 0
+    for start, end, kind in tokens:
+        if kind == "open":
+            if depth == 0:
+                kept.append((pos, start))
+            depth += 1
+        else:  # close
+            if depth == 0:
+                # Orphan close: discard everything up through this close tag.
+                kept = []
+                pos = end
+            else:
+                depth -= 1
+                if depth == 0:
+                    pos = end
+
+    if depth == 0:
+        kept.append((pos, len(content)))
+    # else: unmatched open — drop from the opening tag through EOF (already
+    # excluded from `kept` because we only appended the prefix at depth 0→1).
+
+    return "".join(content[s:e] for s, e in kept)
+
+
 def _emit_aaak_index_sync(drawer_id, content, metadata):
     """Best-effort AAAK index entry generation for a single just-written drawer.
 
@@ -2195,7 +2242,7 @@ def tool_add_drawer(
             "skipped": True,
             "reason": "mempalace_skip_tag",
         }
-    content = re.sub(r"<private>.*?</private>", "", content, flags=re.DOTALL)
+    content = _strip_private_blocks(content)
     if not content.strip():
         return {
             "success": True,
@@ -2256,8 +2303,35 @@ def tool_add_drawer(
         last_chunk_idx = (len(content) - 1) // chunk_size
         idempotency_probe_ids = [drawer_id, f"{drawer_id}_chunk_{last_chunk_idx:06d}"]
     try:
-        existing = col.get(ids=idempotency_probe_ids, include=[])
-        if _get_result_ids(existing):
+        existing = col.get(ids=idempotency_probe_ids, include=["documents", "metadatas"])
+        existing_ids = _get_result_ids(existing)
+        if existing_ids:
+            # Self-healing closets-on-write: re-emit the AAAK index entry on
+            # idempotent adds. This repairs cases where the original drawer write
+            # committed but best-effort closet emission failed. For chunked rows,
+            # use the sanitized full input content as the logical drawer payload.
+            existing_docs = _chroma_field(existing, "documents", []) or []
+            existing_metas = _chroma_field(existing, "metadatas", []) or []
+            existing_content = (
+                existing_docs[0]
+                if existing_docs and existing_docs[0] is not None
+                else content
+            )
+            if existing_ids[0] != drawer_id:
+                existing_content = content
+            existing_meta = (
+                existing_metas[0]
+                if existing_metas and existing_metas[0]
+                else {**base_meta, "chunk_index": 0}
+            )
+            try:
+                _emit_aaak_index_sync(drawer_id, existing_content, dict(existing_meta))
+            except Exception:
+                logger.debug(
+                    "AAAK index re-emission failed for %s; drawer is unaffected.",
+                    drawer_id,
+                    exc_info=True,
+                )
             return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
     except Exception as e:
         logger.warning("Idempotency pre-check failed for %s", idempotency_probe_ids, exc_info=True)
