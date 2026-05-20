@@ -1599,6 +1599,103 @@ class TestWriteTools:
         stored = col.get(ids=[result["drawer_id"]], include=["documents"])
         assert stored["documents"][0] == original
 
+    def test_add_drawer_emits_aaak_index_entry(self, monkeypatch, config, palace_path, kg):
+        """After add_drawer, the closets collection has a matching AAAK index entry.
+
+        AAAK closets-on-write: drawer stays verbatim in mempalace_drawers; an AAAK
+        pointer is emitted synchronously into mempalace_closets so searcher.py
+        picks it up.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, drawer_col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+        from mempalace.palace import get_closets_collection
+
+        original = (
+            "Decision: switched the auth pipeline from Firebase to Supabase to align "
+            "with the cross-platform rewrite. Alice approved on 2026-05-12."
+        )
+        result = tool_add_drawer(
+            wing="work",
+            room="decisions",
+            content=original,
+            source_file="meeting-notes.md",
+        )
+        assert result["success"] is True
+        drawer_id = result["drawer_id"]
+
+        # Drawer stays verbatim — verbatim-always invariant.
+        stored = drawer_col.get(ids=[drawer_id], include=["documents"])
+        assert stored["documents"][0] == original
+
+        # Closet entry exists under the SAME drawer_id with non-empty AAAK content
+        # and the compression stats stamped in metadata.
+        closet_col = get_closets_collection(palace_path, create=False)
+        closet = closet_col.get(ids=[drawer_id], include=["documents", "metadatas"])
+        assert closet["ids"] == [drawer_id]
+        assert closet["documents"][0]
+        assert closet["documents"][0] != original  # AAAK is a separate symbolic form
+        meta = closet["metadatas"][0]
+        assert meta["wing"] == "work"
+        assert meta["room"] == "decisions"
+        assert "compression_ratio" in meta
+        assert "original_tokens" in meta
+
+    def test_aaak_index_failure_does_not_break_drawer(self, monkeypatch, config, palace_path, kg):
+        """If the closets emission raises, the drawer write still succeeds.
+
+        AAAK closets-on-write contract: closets index is best-effort. A failure
+        inside _emit_aaak_index_sync is swallowed; drawer commit is independent
+        and the public tool_add_drawer return value still reports success.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, drawer_col = _get_collection(palace_path, create=True)
+        del _client
+        import mempalace.mcp_server as mcp_server
+        from mempalace.mcp_server import tool_add_drawer
+
+        def boom(*_a, **_kw):
+            raise RuntimeError("simulated closets failure")
+
+        monkeypatch.setattr(mcp_server, "_emit_aaak_index_sync", boom)
+
+        result = tool_add_drawer(wing="w", room="r", content="content that must persist")
+        assert result["success"] is True
+        stored = drawer_col.get(ids=[result["drawer_id"]], include=["documents"])
+        assert stored["documents"][0] == "content that must persist"
+
+    def test_aaak_index_idempotent_when_drawer_already_exists(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Second add_drawer with identical content short-circuits before AAAK emit.
+
+        AAAK closets-on-write must not re-emit the closet entry on the idempotent
+        path — the drawer write is skipped (reason='already_exists') and the
+        closets upsert is skipped too. Closets count stays at 1 across two calls.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _drawer_col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+        from mempalace.palace import get_closets_collection
+
+        content = "Decision: ship v3.3.5 with AAAK closets-on-write index."
+
+        r1 = tool_add_drawer(wing="w", room="r", content=content)
+        assert r1["success"] is True
+        assert "reason" not in r1  # fresh insert
+
+        closet_col = get_closets_collection(palace_path, create=False)
+        count_after_first = closet_col.count()
+        assert count_after_first == 1
+
+        r2 = tool_add_drawer(wing="w", room="r", content=content)
+        assert r2["success"] is True
+        assert r2.get("reason") == "already_exists"
+        assert r2["drawer_id"] == r1["drawer_id"]
+        assert closet_col.count() == count_after_first
+
     def test_delete_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_delete_drawer
