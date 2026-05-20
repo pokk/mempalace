@@ -486,6 +486,36 @@ def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int)
     return chunk_ids, chunk_docs, chunk_metas
 
 
+def _strip_private_blocks(content: str) -> str:
+    opens = [(match.start(), match.end(), True) for match in re.finditer(r"<private>", content)]
+    closes = [(match.start(), match.end(), False) for match in re.finditer(r"</private>", content)]
+    tokens = sorted(opens + closes, key=lambda token: token[0])
+    if not tokens:
+        return content
+
+    kept: list[tuple[int, int]] = []
+    position = 0
+    depth = 0
+    for start, end, is_open in tokens:
+        if is_open:
+            if depth == 0:
+                kept.append((position, start))
+            depth += 1
+        elif depth == 0:
+            # An orphan closing tag makes everything before it private.
+            kept = []
+            position = end
+        else:
+            depth -= 1
+            if depth == 0:
+                position = end
+
+    if depth == 0:
+        kept.append((position, len(content)))
+
+    return "".join(content[start:end] for start, end in kept)
+
+
 def _emit_aaak_index_sync(drawer_id, content, metadata):
     try:
         from ..dialect import Dialect
@@ -526,7 +556,7 @@ def tool_add_drawer(
             "skipped": True,
             "reason": "mempalace_skip_tag",
         }
-    content = re.sub(r"<private>.*?</private>", "", content, flags=re.DOTALL)
+    content = _strip_private_blocks(content)
     if not content.strip():
         return {
             "success": True,
@@ -594,8 +624,29 @@ def tool_add_drawer(
         last_chunk_idx = (len(content) - 1) // chunk_size
         idempotency_probe_ids = [drawer_id, f"{drawer_id}_chunk_{last_chunk_idx:06d}"]
     try:
-        existing = col.get(ids=idempotency_probe_ids, include=[])
-        if _get_result_ids(existing):
+        existing = col.get(ids=idempotency_probe_ids, include=["documents", "metadatas"])
+        existing_ids = _get_result_ids(existing)
+        if existing_ids:
+            existing_docs = _chroma_field(existing, "documents", []) or []
+            existing_metas = _chroma_field(existing, "metadatas", []) or []
+            existing_content = (
+                existing_docs[0] if existing_docs and existing_docs[0] is not None else content
+            )
+            if existing_ids[0] != drawer_id:
+                existing_content = content
+            existing_meta = (
+                existing_metas[0]
+                if existing_metas and existing_metas[0]
+                else {**base_meta, "chunk_index": 0}
+            )
+            try:
+                _emit_aaak_index_sync(drawer_id, existing_content, dict(existing_meta))
+            except Exception:
+                logger.debug(
+                    "AAAK index re-emission failed for %s; drawer is unaffected.",
+                    drawer_id,
+                    exc_info=True,
+                )
             outcome = {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
             _wal_result("add_drawer", outcome)
             return outcome

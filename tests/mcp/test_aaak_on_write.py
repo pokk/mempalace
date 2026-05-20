@@ -74,3 +74,29 @@ def test_aaak_index_idempotent_when_drawer_already_exists(monkeypatch, config, p
     assert second.get("reason") == "already_exists"
     assert second["drawer_id"] == first["drawer_id"]
     assert closet_col.count() == count_after_first
+
+
+def test_already_exists_path_repairs_missing_closet(monkeypatch, config, palace_path, kg):
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _drawer_col = _get_collection(palace_path, create=True)
+    del _client
+    from mempalace.mcp_server import tool_add_drawer
+    from mempalace.palace import get_closets_collection
+
+    content = "Operational note: closet repair on idempotent retry."
+    first = tool_add_drawer(wing="w", room="r", content=content)
+    assert first["success"] is True
+    drawer_id = first["drawer_id"]
+
+    closet_col = get_closets_collection(palace_path, create=False)
+    assert closet_col.count() == 1
+    closet_col.delete(ids=[drawer_id])
+    assert closet_col.count() == 0
+
+    second = tool_add_drawer(wing="w", room="r", content=content)
+    assert second["success"] is True
+    assert second.get("reason") == "already_exists"
+    assert closet_col.count() == 1
+    repaired = closet_col.get(ids=[drawer_id], include=["documents", "metadatas"])
+    assert repaired["ids"] == [drawer_id]
+    assert repaired["documents"] and repaired["documents"][0]
