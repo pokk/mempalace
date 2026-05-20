@@ -3074,6 +3074,33 @@ def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int)
     return chunk_ids, chunk_docs, chunk_metas
 
 
+def _emit_aaak_index_sync(drawer_id, content, metadata):
+    """Best-effort AAAK index entry generation for a single just-written drawer.
+
+    Mirrors ``mempalace compress`` CLI behavior at write-time. The drawer in the
+    ``mempalace_drawers`` collection stays verbatim — this only populates the
+    ``mempalace_closets`` index collection that ``searcher.py`` already consults
+    for entity-boost reranking. Failures here MUST NOT break the drawer write —
+    the closets index is fully recoverable by running ``mempalace compress``.
+    """
+    try:
+        from .dialect import Dialect
+        from .palace import get_closets_collection
+
+        if not _config.palace_path:
+            return
+        dialect = Dialect()
+        compressed = dialect.compress(content, metadata=metadata)
+        stats = dialect.compression_stats(content, compressed)
+        comp_meta = dict(metadata)
+        comp_meta["compression_ratio"] = round(stats["size_ratio"], 1)
+        comp_meta["original_tokens"] = stats["original_tokens_est"]
+        comp_col = get_closets_collection(_config.palace_path, create=True)
+        comp_col.upsert(ids=[drawer_id], documents=[compressed], metadatas=[comp_meta])
+    except Exception:
+        logger.debug("AAAK index emission failed for %s", drawer_id, exc_info=True)
+
+
 def tool_add_drawer(
     wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
 ):
@@ -3091,10 +3118,10 @@ def tool_add_drawer(
     """
     global _metadata_cache
 
-    # Phase 1 privacy filters (must run before sanitize_content so redaction is
-    # honored even if downstream sanitization rewrites whitespace). Verbatim-always
-    # still holds for everything that *does* get stored — these filters only drop
-    # regions the user has explicitly marked as <private> or <mempalace-skip>.
+    # Privacy-tag filters (must run before sanitize_content so redaction is honored
+    # even if downstream sanitization rewrites whitespace). Verbatim-always still
+    # holds for everything that *does* get stored — these filters only drop regions
+    # the user has explicitly marked as <private> or <mempalace-skip>.
     if "<mempalace-skip>" in content:
         return {
             "success": True,
@@ -3171,11 +3198,8 @@ def tool_add_drawer(
 
     try:
         if len(content) <= chunk_size:
-            col.upsert(
-                ids=[drawer_id],
-                documents=[content],
-                metadatas=[{**base_meta, "chunk_index": 0}],
-            )
+            metadata = {**base_meta, "chunk_index": 0}
+            col.upsert(ids=[drawer_id], documents=[content], metadatas=[metadata])
             inserted = col.get(ids=[drawer_id], include=[])
             if not _get_result_ids(inserted):
                 raise RuntimeError(
@@ -3184,6 +3208,14 @@ def tool_add_drawer(
                 )
             _invalidate_overview_caches()
             logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room}")
+            try:
+                _emit_aaak_index_sync(drawer_id, content, dict(metadata))
+            except Exception:
+                logger.debug(
+                    "AAAK index emission raised for %s; drawer commit is unaffected.",
+                    drawer_id,
+                    exc_info=True,
+                )
             return {
                 "success": True,
                 "drawer_id": drawer_id,
@@ -3219,6 +3251,18 @@ def tool_add_drawer(
             )
         _invalidate_overview_caches()
         logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room} ({len(chunk_ids)} chunks)")
+        try:
+            _emit_aaak_index_sync(
+                drawer_id,
+                content,
+                {**base_meta, "chunk_index": 0, "chunks": len(chunk_ids)},
+            )
+        except Exception:
+            logger.debug(
+                "AAAK index emission raised for %s; drawer commit is unaffected.",
+                drawer_id,
+                exc_info=True,
+            )
         return {
             "success": True,
             "drawer_id": drawer_id,
