@@ -2387,11 +2387,14 @@ class TestWriteTools:
     def test_aaak_index_idempotent_when_drawer_already_exists(
         self, monkeypatch, config, palace_path, kg
     ):
-        """Second add_drawer with identical content short-circuits before AAAK emit.
+        """Second add_drawer with identical content self-heals the AAAK index.
 
-        AAAK closets-on-write must not re-emit the closet entry on the idempotent
-        path — the drawer write is skipped (reason='already_exists') and the
-        closets upsert is skipped too. Closets count stays at 1 across two calls.
+        AAAK closets-on-write is now self-healing on the idempotent path: when a
+        retry hits the already_exists short-circuit we still re-emit the closet
+        entry by upserting under the same drawer_id. Re-upsert is a no-op when
+        the closet entry is already correct, so the count stays at 1 across two
+        calls. The dedicated repair-on-retry test below covers the missing-entry
+        case where this self-heal matters.
         """
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _drawer_col = _get_collection(palace_path, create=True)
@@ -2414,6 +2417,91 @@ class TestWriteTools:
         assert r2.get("reason") == "already_exists"
         assert r2["drawer_id"] == r1["drawer_id"]
         assert closet_col.count() == count_after_first
+
+    def test_private_unclosed_tag_strips_to_eof(self, monkeypatch, config, palace_path, kg):
+        """Unmatched opening <private> must strip from that tag to EOF.
+
+        The naive non-greedy regex used previously left the secret stored verbatim
+        when the closing tag was missing, which is a fail-open violation of the
+        privacy contract. The stateful parser strips everything from the orphan
+        opening tag onward.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        result = tool_add_drawer(
+            wing="w",
+            room="r",
+            content="public preamble <private>SECRET_TOKEN_xyz789 dangling no close",
+        )
+        assert result["success"] is True
+        assert result.get("skipped") is not True
+        stored = col.get(ids=[result["drawer_id"]], include=["documents"])
+        doc = stored["documents"][0]
+        assert "SECRET_TOKEN_xyz789" not in doc
+        assert "dangling" not in doc
+        assert "public preamble" in doc
+
+    def test_private_nested_tags_strip_outer_envelope(self, monkeypatch, config, palace_path, kg):
+        """Nested <private> tags must strip the outermost envelope and everything inside.
+
+        The naive non-greedy regex matched the inner pair first and left the
+        outer tags as visible literal text plus their contents still partially
+        present. The stateful parser tracks depth and removes the full envelope.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        result = tool_add_drawer(
+            wing="w",
+            room="r",
+            content="a <private>outer_b <private>inner_c</private> outer_d</private> e",
+        )
+        assert result["success"] is True
+        assert result.get("skipped") is not True
+        stored = col.get(ids=[result["drawer_id"]], include=["documents"])
+        doc = stored["documents"][0]
+        assert "outer_b" not in doc
+        assert "inner_c" not in doc
+        assert "outer_d" not in doc
+        assert "private" not in doc.lower()
+        assert "a" in doc and "e" in doc
+
+    def test_already_exists_path_repairs_missing_closet(self, monkeypatch, config, palace_path, kg):
+        """If the closet entry is missing on the already_exists path, re-add repairs it.
+
+        Regression: the previous behavior returned immediately on the idempotent
+        path, so a silent failure during the first add's AAAK emission left the
+        closet permanently empty for that drawer. The self-heal path re-emits
+        the closet entry from the existing drawer doc and metadata.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _drawer_col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+        from mempalace.palace import get_closets_collection
+
+        content = "Operational note: closet repair on idempotent retry."
+        r1 = tool_add_drawer(wing="w", room="r", content=content)
+        assert r1["success"] is True
+        drawer_id = r1["drawer_id"]
+
+        closet_col = get_closets_collection(palace_path, create=False)
+        assert closet_col.count() == 1
+        closet_col.delete(ids=[drawer_id])
+        assert closet_col.count() == 0
+
+        r2 = tool_add_drawer(wing="w", room="r", content=content)
+        assert r2["success"] is True
+        assert r2.get("reason") == "already_exists"
+        assert closet_col.count() == 1
+        repaired = closet_col.get(ids=[drawer_id], include=["documents", "metadatas"])
+        assert repaired["ids"] == [drawer_id]
+        assert repaired["documents"] and repaired["documents"][0]
 
     def test_delete_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
