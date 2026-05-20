@@ -501,6 +501,20 @@ def tool_add_drawer(
     and all constituent physical chunks.
     """
     global _metadata_cache
+    if "<mempalace-skip>" in content:
+        return {
+            "success": True,
+            "skipped": True,
+            "reason": "mempalace_skip_tag",
+        }
+    content = re.sub(r"<private>.*?</private>", "", content, flags=re.DOTALL)
+    if not content.strip():
+        return {
+            "success": True,
+            "skipped": True,
+            "reason": "empty_after_private_strip",
+        }
+
     try:
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
