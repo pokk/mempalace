@@ -5618,6 +5618,24 @@ class TestStructuredErrors:
 # ── Param-shape diagnostics on tools/call dispatch (#1351) ──────────────
 
 
+def test_tool_input_schemas_are_top_level_objects_without_union_keywords():
+    """OpenCode/OpenAI-compatible tool schemas must be plain objects at top level."""
+    from mempalace import mcp_server
+
+    forbidden_top_level = {"oneOf", "anyOf", "allOf", "enum", "not"}
+    violations = []
+
+    for tool_name, tool in mcp_server.TOOLS.items():
+        schema = tool["input_schema"]
+        if schema.get("type") != "object":
+            violations.append(f"{tool_name}: type={schema.get('type')!r}")
+        present = forbidden_top_level.intersection(schema)
+        if present:
+            violations.append(f"{tool_name}: forbidden top-level keys={sorted(present)!r}")
+
+    assert not violations
+
+
 class TestParamShapeDiagnostics:
     """Dispatch-level TypeError on tools/call should surface as JSON-RPC
     -32602 (Invalid params) with the offending parameter named, instead of
