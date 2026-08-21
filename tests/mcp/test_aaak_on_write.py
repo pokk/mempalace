@@ -73,6 +73,7 @@ def test_aaak_index_idempotent_when_drawer_already_exists(monkeypatch, config, p
     assert second["success"] is True
     assert second.get("reason") == "already_exists"
     assert second["drawer_id"] == first["drawer_id"]
+    closet_col = get_closets_collection(palace_path, create=False)
     assert closet_col.count() == count_after_first
 
 
@@ -96,6 +97,7 @@ def test_already_exists_path_repairs_missing_closet(monkeypatch, config, palace_
     second = tool_add_drawer(wing="w", room="r", content=content)
     assert second["success"] is True
     assert second.get("reason") == "already_exists"
+    closet_col = get_closets_collection(palace_path, create=False)
     assert closet_col.count() == 1
     repaired = closet_col.get(ids=[drawer_id], include=["documents", "metadatas"])
     assert repaired["ids"] == [drawer_id]
