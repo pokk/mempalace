@@ -2416,6 +2416,9 @@ class TestWriteTools:
         assert r2["success"] is True
         assert r2.get("reason") == "already_exists"
         assert r2["drawer_id"] == r1["drawer_id"]
+        # Re-fetch: a write reopens the backend and resets chromadb's System
+        # cache, so any collection handle held across it is stale.
+        closet_col = get_closets_collection(palace_path, create=False)
         assert closet_col.count() == count_after_first
 
     def test_private_unclosed_tag_strips_to_eof(self, monkeypatch, config, palace_path, kg):
@@ -2498,6 +2501,7 @@ class TestWriteTools:
         r2 = tool_add_drawer(wing="w", room="r", content=content)
         assert r2["success"] is True
         assert r2.get("reason") == "already_exists"
+        closet_col = get_closets_collection(palace_path, create=False)
         assert closet_col.count() == 1
         repaired = closet_col.get(ids=[drawer_id], include=["documents", "metadatas"])
         assert repaired["ids"] == [drawer_id]
